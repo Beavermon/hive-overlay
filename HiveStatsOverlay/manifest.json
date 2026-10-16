@@ -1,0 +1,17 @@
+{
+  "uuid": "ea6627bc-3d71-4a49-b55c-e24df6c23f6c",
+  "plugin_name": "Hive Stats Overlay",
+  "plugin_author": "BeavermonE",
+  "plugin_description": "Displays Hive stats of players in your lobby",
+  "plugin_version": "1.1.2",
+  "game_version": "1.26.44",
+  "supported_game_version_ranges": [
+    "0.0.0-9.99.9"
+  ],
+  "categories": [
+    "Utility"
+  ],
+  "runtime_version": 8,
+  "target_assembly": "HiveStatsOverlay.dll",
+  "repository_url": "https://github.com/Beavermon/onix-hive-overlay"
+}

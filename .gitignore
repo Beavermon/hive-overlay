@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+.vs/
+.idea/
+.vscode/
+BuildSuccessful.txt
+HiveStatsOverlay/Assets/README.md
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.pdb
+*.tmp
+*.bak
