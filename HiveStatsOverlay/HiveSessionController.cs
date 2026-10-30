@@ -78,6 +78,7 @@ internal sealed partial class HiveSessionController : IDisposable
 
     private void OnSessionJoined()
     {
+        isHive = false;
         waitingForNextGame = false;
         completedServer = "";
         Volatile.Write(ref dimensionTransitionGame, (int)HiveGame.Unknown);
@@ -129,7 +130,9 @@ internal sealed partial class HiveSessionController : IDisposable
             RefreshStatsMode();
 
         bool wasHive = isHive;
-        isHive = IsHiveConnection();
+        if (IsHiveConnection())
+            isHive = true;
+
         if (!isHive)
         {
             if (wasHive || isInMatch || rows.Count != 0 || eliminatedPlayers.Count != 0)
@@ -140,9 +143,14 @@ internal sealed partial class HiveSessionController : IDisposable
             localUsername = "";
             isInMatch = false;
             matchStarted = false;
-            connectionPollingEnabled = false;
             waitingForNextGame = false;
             completedServer = "";
+
+            if (connectionPollingEnabled && Onix.LocalPlayer is not null && Onix.World is not null)
+            {
+                connectionPollingEnabled = false;
+                Onix.Game.ExecuteCommand("/connection");
+            }
             return;
         }
 
@@ -296,10 +304,16 @@ internal sealed partial class HiveSessionController : IDisposable
 
     private bool OnChatReceive(string message, string _, string __, ChatMessageType ___)
     {
+        string cleaned = StripFormatting(message);
+        if (TryParseConnection(cleaned, out string parsed))
+        {
+            ApplyConnectionServer(parsed);
+            return true;
+        }
+
         if (!isHive)
             return false;
 
-        string cleaned = StripFormatting(message);
         ObserveHiveAutoQueueSignals(cleaned);
         ObserveMatchStartSignal(cleaned);
         ObserveRosterRemovalSignal(cleaned);
@@ -307,9 +321,6 @@ internal sealed partial class HiveSessionController : IDisposable
         bool isConnectionResponse = cleaned.Contains("You are connected to", StringComparison.OrdinalIgnoreCase);
         if (!isConnectionResponse)
             return false;
-
-        if (TryParseConnection(cleaned, out string parsed))
-            ApplyConnectionServer(parsed);
 
         return true;
     }
@@ -474,6 +485,7 @@ internal sealed partial class HiveSessionController : IDisposable
 
     private void ApplyConnectionServer(string server)
     {
+        isHive = true;
         bool isHub = server.Contains("HUB", StringComparison.OrdinalIgnoreCase);
         HiveGame detectedGame = isHub ? HiveGame.Unknown : HiveGames.FromServer(server);
         if (waitingForNextGame && detectedGame != HiveGame.Unknown && server.Equals(completedServer, StringComparison.OrdinalIgnoreCase))
