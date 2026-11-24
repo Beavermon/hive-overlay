@@ -63,17 +63,7 @@ internal sealed partial class HiveSessionController : IDisposable
         Onix.Events.Session.Chat.CommandResponse += OnCommandResponse;
         Onix.Events.Session.Chat.Receive += OnChatReceive;
         Onix.Events.Session.Chat.SendCommand += OnSendCommand;
-        backgroundTasks.Track(InitializeBackgroundAsync());
         ResetLobby();
-    }
-
-    private async Task InitializeBackgroundAsync()
-    {
-        try
-        {
-            await api.InitializeAsync(pluginEjectionToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (pluginEjectionToken.IsCancellationRequested) { }
     }
 
     private void OnSessionJoined()

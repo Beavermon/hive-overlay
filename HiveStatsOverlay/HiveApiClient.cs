@@ -15,22 +15,11 @@ internal sealed class HiveApiClient : IDisposable
 
     private readonly HttpClient http;
     private readonly SemaphoreSlim concurrency = new(3, 3);
-    private readonly Dictionary<HiveGame, HiveLevelCalculator> levels = new()
-    {
-        [HiveGame.BedWars] = new(100),
-        [HiveGame.SkyWars] = new(100),
-        [HiveGame.MurderMystery] = new(100),
-        [HiveGame.HideAndSeek] = new(100),
-        [HiveGame.SurvivalGames] = new(50),
-        [HiveGame.Bridge] = new(20),
-        [HiveGame.CaptureTheFlag] = new(50)
-    };
     private readonly Dictionary<string, CacheEntry> cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Task<PlayerStats>> inFlight = new(StringComparer.OrdinalIgnoreCase);
     private readonly object gate = new();
     private readonly string? cachePath;
     private readonly CancellationToken shutdownToken;
-    private Task? initializationTask;
     private bool disposed;
 
     public HiveApiClient(string? cachePath, CancellationToken shutdownToken)
@@ -39,46 +28,18 @@ internal sealed class HiveApiClient : IDisposable
         this.shutdownToken = shutdownToken;
         http = new HttpClient
         {
-            BaseAddress = new Uri("https://api.playhive.com/"),
+            BaseAddress = new Uri("https://api.hivebackpack.com/"),
             Timeout = TimeSpan.FromSeconds(10)
         };
-        http.DefaultRequestHeaders.UserAgent.ParseAdd("OnixHiveStatsOverlay/1.1.2");
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("OnixHiveStatsOverlay/1.2.0");
         http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         LoadCache();
-    }
-
-    public Task InitializeAsync(CancellationToken cancellationToken = default)
-    {
-        lock (gate)
-        {
-            initializationTask ??= InitializeCoreAsync(shutdownToken);
-            return cancellationToken.CanBeCanceled
-                ? initializationTask.WaitAsync(cancellationToken)
-                : initializationTask;
-        }
-    }
-
-    private async Task InitializeCoreAsync(CancellationToken cancellationToken)
-    {
-        await Task.WhenAll(levels.Select(pair => LoadMetadataAsync(pair.Key, pair.Value, cancellationToken)));
-    }
-
-    private async Task LoadMetadataAsync(HiveGame game, HiveLevelCalculator calculator, CancellationToken cancellationToken)
-    {
-        try
-        {
-            using HttpResponseMessage response = await http.GetAsync($"v0/game/meta/{game.ApiCode()}", cancellationToken);
-            if (response.IsSuccessStatusCode)
-                calculator.TryUpdateFromMetadata(await response.Content.ReadAsStringAsync(cancellationToken));
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception) { }
     }
 
     public Task<PlayerStats> GetPlayerAsync(string username, HiveGame game, PlayerStatsMode mode, CancellationToken cancellationToken)
     {
         string normalized = Normalize(username);
-        string cacheKey = $"{game.ApiCode()}-v3:{(int)mode}:{normalized}";
+        string cacheKey = $"hivebackpack-v1:{game.ApiCode()}:{(int)mode}:{normalized}";
         lock (gate)
         {
             DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -125,6 +86,9 @@ internal sealed class HiveApiClient : IDisposable
         lock (gate)
         {
             DateTimeOffset now = DateTimeOffset.UtcNow;
+            DateTimeOffset retainUntil = result.Status == PlayerStatsStatus.Ready
+                ? now + SuccessRetention
+                : now + ttl;
             if (result.Status != PlayerStatsStatus.Ready &&
                 cache.TryGetValue(cacheKey, out CacheEntry? stale) &&
                 stale.Stats.Status == PlayerStatsStatus.Ready &&
@@ -132,10 +96,13 @@ internal sealed class HiveApiClient : IDisposable
             {
                 ttl = result.Status == PlayerStatsStatus.RateLimited ? RateLimitTtl(result) : FailureTtl;
                 result = stale.Stats with { Username = username };
+                retainUntil = stale.RetainUntil;
             }
 
-            DateTimeOffset retainUntil = result.Status == PlayerStatsStatus.Ready ? now + SuccessRetention : now + ttl;
-            cache[cacheKey] = new CacheEntry(result, now + ttl, retainUntil);
+            DateTimeOffset expiresAt = now + ttl;
+            if (expiresAt > retainUntil)
+                expiresAt = retainUntil;
+            cache[cacheKey] = new CacheEntry(result, expiresAt, retainUntil);
             TrimCache(now);
             SaveCache();
         }
@@ -144,7 +111,6 @@ internal sealed class HiveApiClient : IDisposable
 
     private async Task<PlayerStats> FetchPlayerAsync(string username, HiveGame game, PlayerStatsMode mode, CancellationToken cancellationToken)
     {
-        await InitializeAsync();
         if (mode == PlayerStatsMode.AllTime)
             return await FetchAllTimeAsync(username, game, cancellationToken);
 
@@ -160,13 +126,9 @@ internal sealed class HiveApiClient : IDisposable
         try
         {
             string escaped = Uri.EscapeDataString(username);
-            using HttpResponseMessage response = await http.GetAsync($"v0/game/all/{game.ApiCode()}/{escaped}", cancellationToken);
-            if (response.StatusCode == HttpStatusCode.NotFound)
-                return await ResolveMissingPlayerAsync(username, escaped, cancellationToken);
-            if ((int)response.StatusCode == 429)
-                return Error(username, PlayerStatsStatus.RateLimited, GetRetryAt(response));
+            using HttpResponseMessage response = await http.GetAsync($"players/{escaped}/statistics/all", cancellationToken);
             if (!response.IsSuccessStatusCode)
-                return Error(username, PlayerStatsStatus.Unavailable);
+                return await ErrorFromResponseAsync(username, response, cancellationToken);
 
             string json = await response.Content.ReadAsStringAsync(cancellationToken);
             return ParseAllTime(username, game, json);
@@ -185,34 +147,18 @@ internal sealed class HiveApiClient : IDisposable
         }
     }
 
-    private async Task<PlayerStats> ResolveMissingPlayerAsync(string username, string escaped, CancellationToken cancellationToken)
-    {
-        using HttpResponseMessage response = await http.GetAsync($"v0/game/all/main/{escaped}", cancellationToken);
-        if (response.StatusCode == HttpStatusCode.NotFound)
-            return Error(username, PlayerStatsStatus.Nicked);
-        if ((int)response.StatusCode == 429)
-            return Error(username, PlayerStatsStatus.RateLimited, GetRetryAt(response));
-        return response.IsSuccessStatusCode
-            ? Error(username, PlayerStatsStatus.NoData)
-            : Error(username, PlayerStatsStatus.Unavailable);
-    }
-
     private async Task<PlayerStats> FetchMonthlyAsync(string username, HiveGame game, PlayerStats allTime, CancellationToken cancellationToken)
     {
         await concurrency.WaitAsync(cancellationToken);
         try
         {
             string escaped = Uri.EscapeDataString(username);
-            using HttpResponseMessage response = await http.GetAsync($"v1/player/game/{game.ApiCode()}/monthly/{escaped}", cancellationToken);
-            if (response.StatusCode == HttpStatusCode.NotFound)
-                return ClearMatchStats(allTime);
-            if ((int)response.StatusCode == 429)
-                return Error(username, PlayerStatsStatus.RateLimited, GetRetryAt(response));
+            using HttpResponseMessage response = await http.GetAsync($"players/{escaped}/statistics/monthly", cancellationToken);
             if (!response.IsSuccessStatusCode)
-                return Error(username, PlayerStatsStatus.Unavailable);
+                return await ErrorFromResponseAsync(username, response, cancellationToken);
 
             string json = await response.Content.ReadAsStringAsync(cancellationToken);
-            return MergeMonthly(allTime, json);
+            return MergeMonthly(allTime, game, json);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -234,14 +180,21 @@ internal sealed class HiveApiClient : IDisposable
         {
             using JsonDocument document = JsonDocument.Parse(json);
             JsonElement response = document.RootElement;
-            JsonElement root = response.TryGetProperty(game.ApiCode(), out JsonElement gameStats) ? gameStats : response;
+            if (response.TryGetProperty("success", out JsonElement success) && success.ValueKind == JsonValueKind.False)
+                return Error(username, PlayerStatsStatus.NoData);
+            if (!response.TryGetProperty("data", out JsonElement data) ||
+                !data.TryGetProperty("statistics", out JsonElement statistics) ||
+                statistics.ValueKind != JsonValueKind.Object)
+                return Error(username, PlayerStatsStatus.InvalidResponse);
+            if (!statistics.TryGetProperty(game.ApiCode(), out JsonElement root) || root.ValueKind == JsonValueKind.Null)
+                return Error(username, PlayerStatsStatus.NoData);
             if (root.ValueKind != JsonValueKind.Object ||
                 (!root.TryGetProperty("xp", out _) && !root.TryGetProperty("played", out _)))
                 return Error(username, PlayerStatsStatus.NoData);
 
             return ReadStats(username, root) with
             {
-                Level = levels[game].GetLevel(Int(root, "xp")),
+                Level = WholeLevel(root, "level"),
                 Prestige = Int(root, "prestige")
             };
         }
@@ -251,18 +204,53 @@ internal sealed class HiveApiClient : IDisposable
         }
     }
 
-    internal static PlayerStats MergeMonthly(PlayerStats allTime, string json)
+    internal static PlayerStats MergeMonthly(PlayerStats allTime, HiveGame game, string json)
     {
         try
         {
             using JsonDocument document = JsonDocument.Parse(json);
-            JsonElement root = document.RootElement;
+            JsonElement response = document.RootElement;
+            if (!response.TryGetProperty("data", out JsonElement data) ||
+                !data.TryGetProperty("statistics", out JsonElement statistics) ||
+                statistics.ValueKind != JsonValueKind.Object)
+                return Error(allTime.Username, PlayerStatsStatus.InvalidResponse);
+            if (!statistics.TryGetProperty(game.ApiCode(), out JsonElement root) || root.ValueKind == JsonValueKind.Null)
+                return ClearMatchStats(allTime);
+            if (root.ValueKind != JsonValueKind.Object)
+                return Error(allTime.Username, PlayerStatsStatus.InvalidResponse);
             PlayerStats monthly = ReadStats(allTime.Username, root);
             return monthly with { Level = allTime.Level, Prestige = allTime.Prestige };
         }
         catch (Exception exception) when (exception is JsonException or InvalidOperationException or FormatException)
         {
             return Error(allTime.Username, PlayerStatsStatus.InvalidResponse);
+        }
+    }
+
+    private static async Task<PlayerStats> ErrorFromResponseAsync(string username, HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        if ((int)response.StatusCode == 429)
+            return Error(username, PlayerStatsStatus.RateLimited, GetRetryAt(response));
+        if (response.StatusCode is not (HttpStatusCode.BadRequest or HttpStatusCode.NotFound))
+            return Error(username, PlayerStatsStatus.Unavailable);
+
+        string body = await response.Content.ReadAsStringAsync(cancellationToken);
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(body);
+            string message = document.RootElement.TryGetProperty("error", out JsonElement error) &&
+                             error.ValueKind == JsonValueKind.Object &&
+                             error.TryGetProperty("message", out JsonElement messageValue)
+                ? messageValue.GetString() ?? ""
+                : "";
+            return Error(username,
+                message.StartsWith("Invalid identifier", StringComparison.OrdinalIgnoreCase)
+                    ? PlayerStatsStatus.Nicked
+                    : PlayerStatsStatus.NoData);
+        }
+        catch (JsonException)
+        {
+            return Error(username, PlayerStatsStatus.NoData);
         }
     }
 
@@ -302,6 +290,11 @@ internal sealed class HiveApiClient : IDisposable
 
     private static int Int(JsonElement root, string name) =>
         root.TryGetProperty(name, out JsonElement value) && value.TryGetInt32(out int parsed) ? parsed : 0;
+
+    private static int WholeLevel(JsonElement root, string name) =>
+        root.TryGetProperty(name, out JsonElement value) && value.TryGetDouble(out double parsed)
+            ? (int)Math.Floor(parsed)
+            : 0;
 
     private static string Normalize(string username) => username.Trim().ToUpperInvariant();
 
@@ -385,18 +378,14 @@ internal sealed class HiveApiClient : IDisposable
             return;
         disposed = true;
 
-        Task? init;
         Task<PlayerStats>[] inflight;
         lock (gate)
         {
-            init = initializationTask;
             inflight = inFlight.Values.ToArray();
         }
 
-        List<Task> pending = new(inflight.Length + 1);
+        List<Task> pending = new(inflight.Length);
         pending.AddRange(inflight);
-        if (init is not null)
-            pending.Add(init);
 
         if (pending.Count > 0)
         {
@@ -410,6 +399,5 @@ internal sealed class HiveApiClient : IDisposable
         }
 
         http.Dispose();
-        concurrency.Dispose();
     }
 }
